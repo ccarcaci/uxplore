@@ -1,3 +1,5 @@
+.SILENT:
+
 # Variables
 SHELL := /bin/bash
 IMAGE_NAME := uxplore
@@ -11,50 +13,50 @@ KERNEL_REPO := https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.gi
 
 # Help
 help: ## Show this help message
-	@echo "Podman Development Environment"
-	@echo "============================="
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	echo "Podman Development Environment"
+	echo "============================="
+	grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 # Build
 build: ## Build uxplore image
-	@echo "building uxplore image"
-	@podman build --ssh default --tag $(IMAGE_NAME) .
+	echo "building uxplore image"
+	podman build --ssh default --tag $(IMAGE_NAME) .
 
 build-debug: ## Build uxplore image at debug stage
-	@echo "building uxplore image for debug"
-	@podman build --ssh default=$SSH_AUTH_SOCK --target dbg --tag $(IMAGE_NAME):dbg .
+	echo "building uxplore image for debug"
+	podman build --ssh default=$SSH_AUTH_SOCK --target dbg --tag $(IMAGE_NAME):dbg .
 
 launch-debug:
-	@podman run -it --rm --name $(CONTAINER_NAME)-debug $(IMAGE_NAME):dbg sh
+	podman run -it --rm --name $(CONTAINER_NAME)-debug $(IMAGE_NAME):dbg sh
 
 # Podman machine management
 start: ## Start podman machine
-	@echo "starting podman machine"
-	@podman machine start || echo "Machine already running"
+	echo "starting podman machine"
+	podman machine start || echo "Machine already running"
 
 stop: ## Stop podman machine
-	@echo "stopping podman machine"
-	@podman machine stop || echo "Machine already stopped"
+	echo "stopping podman machine"
+	podman machine stop || echo "Machine already stopped"
 
 status: ## Show podman machine status
-	@echo "podman machine status"
-	@podman machine list
+	echo "podman machine status"
+	podman machine list
 
 # Container management
 shell: start build ## Start machine and open Alpine Linux shell
-	@echo "opening Alpine Linux shell"
-	@podman build --tag $(IMAGE_NAME) .
-	@podman run -it --rm --name $(CONTAINER_NAME) $(IMAGE_NAME) sh
+	echo "opening Alpine Linux shell"
+	podman build --tag $(IMAGE_NAME) .
+	podman run -it --rm --name $(CONTAINER_NAME) $(IMAGE_NAME) sh
 
 clean: ## Remove all containers and images
-	@echo "cleaning up containers and images"
-	@podman container prune -f || true
-	@podman image prune -f || true
+	echo "cleaning up containers and images"
+	podman container prune -f || true
+	podman image prune -f || true
 
 # Volume management
 setup-kernel-volume: start ## Create volume and checkout Linux kernel source
-	@echo "Creating volume $(VOLUME_NAME)"
-	@podman volume create $(VOLUME_NAME) || echo "Volume already exists"
-	@echo "Checking out Linux kernel source code..."
-	@podman run --rm -v $(VOLUME_NAME):/kernel alpine/git clone --depth 1 $(KERNEL_REPO) /kernel
-	@echo "Linux kernel source code checked out to volume $(VOLUME_NAME)"
+	echo "Creating volume $(VOLUME_NAME)"
+	podman volume create $(VOLUME_NAME) || echo "Volume already exists"
+	echo "Checking out Linux kernel source code..."
+	podman run --rm -v $(VOLUME_NAME):/kernel alpine/git clone --depth 1 $(KERNEL_REPO) /kernel
+	echo "Linux kernel source code checked out to volume $(VOLUME_NAME)"
