@@ -2,10 +2,12 @@
 SHELL := /bin/bash
 IMAGE_NAME := uxplore
 CONTAINER_NAME := uxplore
+VOLUME_NAME := linux-kernel-src
+KERNEL_REPO := https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
 .DEFAULT_GOAL := help
 
 # Phony targets
-.PHONY: help build start shell stop clean status
+.PHONY: help build start shell stop clean status setup-kernel-volume
 
 # Help
 help: ## Show this help message
@@ -49,3 +51,10 @@ clean: ## Remove all containers and images
 	@podman container prune -f || true
 	@podman image prune -f || true
 
+# Volume management
+setup-kernel-volume: start ## Create volume and checkout Linux kernel source
+	@echo "Creating volume $(VOLUME_NAME)"
+	@podman volume create $(VOLUME_NAME) || echo "Volume already exists"
+	@echo "Checking out Linux kernel source code..."
+	@podman run --rm -v $(VOLUME_NAME):/kernel alpine/git clone --depth 1 $(KERNEL_REPO) /kernel
+	@echo "Linux kernel source code checked out to volume $(VOLUME_NAME)"
