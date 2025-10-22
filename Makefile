@@ -9,7 +9,7 @@ KERNEL_REPO := https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.gi
 .DEFAULT_GOAL := help
 
 # Phony targets
-.PHONY: help build start shell stop clean status setup-kernel-volume
+.PHONY: help build start shell stop clean status setup-kernel-volume update-kernel-volume
 
 # Help
 help: ## Show this help message
@@ -20,11 +20,11 @@ help: ## Show this help message
 # Build
 build: ## Build uxplore image
 	echo "building uxplore image"
-	podman build --ssh default --tag $(IMAGE_NAME) .
+	podman build --tag $(IMAGE_NAME) .
 
 build-debug: ## Build uxplore image at debug stage
 	echo "building uxplore image for debug"
-	podman build --ssh default=$SSH_AUTH_SOCK --target dbg --tag $(IMAGE_NAME):dbg .
+	podman build --target dbg --tag $(IMAGE_NAME):dbg .
 
 launch-debug:
 	podman run -it --rm --name $(CONTAINER_NAME)-debug $(IMAGE_NAME):dbg sh
@@ -46,7 +46,7 @@ status: ## Show podman machine status
 shell: start build ## Start machine and open Alpine Linux shell
 	echo "opening Alpine Linux shell"
 	podman build --tag $(IMAGE_NAME) .
-	podman run -it --rm --name $(CONTAINER_NAME) $(IMAGE_NAME) sh
+	podman run -it --rm --volume $(VOLUME_NAME):/kernel --name $(CONTAINER_NAME) $(IMAGE_NAME) sh
 
 clean: ## Remove all containers and images
 	echo "cleaning up containers and images"
@@ -58,5 +58,12 @@ setup-kernel-volume: start ## Create volume and checkout Linux kernel source
 	echo "Creating volume $(VOLUME_NAME)"
 	podman volume create $(VOLUME_NAME) || echo "Volume already exists"
 	echo "Checking out Linux kernel source code..."
-	podman run --rm -v $(VOLUME_NAME):/kernel alpine/git clone --depth 1 $(KERNEL_REPO) /kernel
+	podman run --rm --volume $(VOLUME_NAME):/kernel alpine/git clone --depth 1 $(KERNEL_REPO) /kernel
 	echo "Linux kernel source code checked out to volume $(VOLUME_NAME)"
+
+update-kernel-volume: start ## Fetch latest master commit and update kernel source
+	echo "Updating Linux kernel source to latest master..."
+	podman run --rm --volume $(VOLUME_NAME):/kernel alpine/git -C /kernel fetch origin master
+	podman run --rm --volume $(VOLUME_NAME):/kernel alpine/git -C /kernel reset --hard FETCH_HEAD
+	podman run --rm --volume $(VOLUME_NAME):/kernel alpine/git -C /kernel clean -fd
+	echo "Linux kernel source updated to latest master commit"
