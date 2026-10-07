@@ -1,16 +1,20 @@
-FROM alpine:latest AS base
+FROM debian:stable-slim AS base
 
-# Install git and neovim
-RUN apk update; apk add --no-cache curl
+# Kernel build toolchain, see https://docs.kernel.org/process/changes.html
+RUN apt-get update && \
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl git \
+    build-essential binutils bc bison flex gawk \
+    libssl-dev openssl libelf-dev dwarves \
+    perl python3 kmod cpio rsync \
+    tar gzip xz-utils zstd bzip2 lz4 \
+    libncurses-dev && \
+  rm -rf /var/lib/apt/lists/*
 
-RUN addgroup -g 1001 uxploregroup && \
-  adduser -u 1001 -G uxploregroup -s /bin/sh -D uxploreuser
+RUN groupadd -g 1001 uxploregroup && \
+  useradd -u 1001 -g uxploregroup -s /bin/sh -m uxploreuser && \
+  mkdir -p /home/git/linux && \
+  chown uxploreuser:uxploregroup /home/git/linux
 USER uxploreuser
 
-FROM base AS dbg
-
-# Set working directory to the volume
-WORKDIR /kernel
-
-# Create volume for Linux kernel source code
-VOLUME /kernel
+WORKDIR /home/git/linux
