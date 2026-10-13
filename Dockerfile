@@ -22,7 +22,10 @@ ENV HELIX_RUNTIME=/opt/helix/runtime
 RUN groupadd -g 1001 uxploregroup && \
   useradd -u 1001 -g uxploregroup -s /bin/sh -m uxploreuser && \
   mkdir -p /home/git/linux && \
-  chown uxploreuser:uxploregroup /home/git/linux
+  chown uxploreuser:uxploregroup /home/git/linux && \
+  echo " \
+export COLORTERM=truecolor\n \
+export TERM=xterm-256color" > /home/uxploreuser/.bashrc
 USER uxploreuser
 
 WORKDIR /home/uxploreuser/git/linux
