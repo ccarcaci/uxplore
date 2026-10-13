@@ -4,9 +4,12 @@
 SHELL := /bin/bash
 IMAGE_NAME := uxplore
 CONTAINER_NAME := uxplore
-KERNEL_SOURCE_DIR := /home/git/linux
+HELIX_LOCAL_CONFIGS := $(HOME)/.config/helix
+UXPLOREUSER_HOME := /home/uxploreuser
+KERNEL_SOURCE_DIR := $(UXPLOREUSER_HOME)/git/linux
 KERNEL_SOURCE_VOLUME := kernel_src
 KERNEL_REPO := https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+HELIX_UXPLORE_CONFIGS := $(UXPLOREUSER_HOME)/.config/helix
 .DEFAULT_GOAL := help
 
 # Phony targets
@@ -27,13 +30,9 @@ shell: build ## Build and open bash pointing to kernel directory
 	echo "opening bash shell"
 	docker run --interactive --tty --rm \
 		--volume $(KERNEL_SOURCE_VOLUME):$(KERNEL_SOURCE_DIR) \
+		--volume $(HELIX_LOCAL_CONFIGS):$(HELIX_UXPLORE_CONFIGS) \
 		--name $(CONTAINER_NAME) $(IMAGE_NAME) \
 		bash
-
-clean: ## Remove all containers and images
-	echo "cleaning up containers and images"
-	docker container prune -f || true
-	docker image prune -f || true
 
 # Kernel source management
 clone_kernel: build ## Clone Linux kernel source into the kernel volume
