@@ -7,7 +7,7 @@ The default target architecture is **x86_64**.
 ## Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/)
-- [QEMU](https://www.qemu.org/download/) (`brew install qemu`)
+- [QEMU](https://www.qemu.org/download/)
 
 ## How it works
 
@@ -50,7 +50,7 @@ Type `exit`, then press `CTRL+A` followed by `X`.
 
 Note: `exit` ends the shell, which is PID 1, so the kernel panics with `Attempted to kill init!`. That's harmless, but `CTRL+A X` alone is enough to quit.
 
-## Cross-compile for another architecture
+## Cross-compile for another architecture (not tested yet)
 
 Example for arm64. The other architectures follow the same pattern with a different `ARCH`, toolchain, and QEMU binary.
 
