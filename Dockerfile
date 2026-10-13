@@ -8,7 +8,7 @@ RUN apt-get update && \
     libssl-dev openssl libelf-dev dwarves \
     perl python3 kmod cpio rsync \
     tar gzip xz-utils zstd bzip2 lz4 \
-    libncurses-dev && \
+    libncurses-dev man-db busybox-static && \
   rm -rf /var/lib/apt/lists/*
 
 # Helix editor, latest release, see https://docs.helix-editor.com/package-managers.html
@@ -26,6 +26,10 @@ RUN groupadd -g 1001 uxploregroup && \
   echo " \
 export COLORTERM=truecolor\n \
 export TERM=xterm-256color" > /home/uxploreuser/.bashrc
+
+COPY build_initram.sh /home/uxploreuser
+RUN chmod +x /home/uxploreuser/build_initram.sh
+
 USER uxploreuser
 
 WORKDIR /home/uxploreuser/git/linux

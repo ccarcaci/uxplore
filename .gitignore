@@ -8,3 +8,6 @@
 
 .ignore
 .mcp.json
+
+bzImage
+initramfs.cpio.gz
