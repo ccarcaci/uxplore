@@ -36,7 +36,7 @@ launch: build
 # Container management
 shell:
 	echo "opening bash shell"
-	docker exec --interactive --tty \
+	docker exec --interactive --tty --env TERM \
 		$(CONTAINER_NAME) bash
 
 stop:
