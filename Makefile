@@ -25,7 +25,7 @@ build: ## Build uxplore image and volume
 	docker volume create $(KERNEL_SOURCE_VOLUME)
 	docker build --tag $(IMAGE_NAME) .
 
-launch: build
+launch: build ## Launch uxplore container in the backgound
 	echo "launching uxplore container"
 	docker run --rm \
 		--volume $(KERNEL_SOURCE_VOLUME):$(KERNEL_SOURCE_DIR) \
@@ -34,12 +34,12 @@ launch: build
 		$(IMAGE_NAME) sleep infinity > /dev/null &
 
 # Container management
-shell:
+shell: ## Open interactive bash
 	echo "opening bash shell"
 	docker exec --interactive --tty --env TERM \
 		$(CONTAINER_NAME) bash
 
-stop:
+stop: ## Stop uxplore container
 	docker stop $(CONTAINER_NAME)
 
 # Kernel source management
