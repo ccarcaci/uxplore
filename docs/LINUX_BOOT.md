@@ -1,1205 +1,317 @@
-# How Linux boots on x86_64: from CPU reset to a shell prompt
+# How Linux boots on x86_64
 
-This document covers three ways an x86_64 machine reaches a running Linux shell:
+A high-level walk from CPU reset to the BusyBox shell that `make after_compilation_launch` gives you.
+It explains *what* each stage does and *where* to look in the code.
 
-1. **QEMU `-kernel`** (SeaBIOS): the path that `make after_compilation_launch` runs in this repo.
-   ```
-   qemu-system-x86_64 ... -kernel bzImage -initrd initramfs.cpio.gz -append "console=ttyS0"
-   ```
-2. **Legacy BIOS from a disk**: BIOS → MBR → GRUB → kernel. This is a pre-UEFI PC, or a UEFI PC in CSM mode.
-3. **UEFI**: firmware → (optional bootloader) → the kernel's **EFI stub**. Any PC built in roughly the last decade boots this way.
-
-Stages 0–10 below walk path 1 in full detail. The three paths **converge at different stages**, so
-[Part II](#part-ii--real-hardware-boot-paths) only describes where paths 2 and 3 diverge and where they rejoin.
-Start with the [comparison table](#the-three-paths-at-a-glance) if you only want the differences.
-
-The kernel references point at the source tree inside the `uxplore` container
+Kernel references point at the source tree inside the `uxplore` container
 (`/home/uxploreuser/git/linux`, commit `0fcb05b72`, `make kernelversion` = `7.3.0-rc7`).
-Paths are relative to that directory. Line numbers belong to this commit and will move when you run `make update_kernel`.
+Line numbers belong to this commit and will move when you run `make update_kernel`.
 
-> **Scope and caveats**
-> - Code before the kernel (CPU reset, SeaBIOS, UEFI firmware, GRUB, QEMU) is **not** in the kernel tree.
->   It is described from external sources, cited inline. Where I could not verify a detail, the text says so.
-> - With `-kernel`, QEMU **does not** read a boot sector from a disk. No MBR, GRUB, or `0x7C00`
->   boot sector runs. QEMU plays the bootloader role itself. **This is the main reason the QEMU
->   path is not representative of real hardware.** See [Part II](#part-ii--real-hardware-boot-paths).
-> - Secure Boot, the shim, TPM measured boot, and network boot (PXE/HTTP) are mentioned only in passing.
+This repo boots with **QEMU `-kernel`** on SeaBIOS:
+
+```
+qemu-system-x86_64 ... -kernel bzImage -initrd initramfs.cpio.gz -append "console=ttyS0"
+```
+
+The last section explains how real BIOS and UEFI machines differ.
 
 ---
 
-## Overview
+## The big picture
 
-| # | Stage | CPU mode | Where the code lives |
-|---|-------|----------|----------------------|
+| # | Stage | CPU mode | Code |
+|---|-------|----------|------|
 | 0 | CPU reset | 16-bit real mode | hardware |
-| 1 | BIOS POST | real mode / 32-bit (SeaBIOS internal) | SeaBIOS |
-| 2 | Bootloader: load bzImage + initrd | real mode | QEMU `linuxboot_dma` option ROM |
+| 1 | BIOS POST | real mode | SeaBIOS |
+| 2 | Load bzImage + initrd | real mode | QEMU `linuxboot_dma` option ROM |
 | 3 | Kernel real-mode setup | 16-bit real mode | `arch/x86/boot/` |
-| 4 | Switch to protected mode | real → 32-bit protected | `arch/x86/boot/pm.c`, `pmjump.S` |
-| 5 | Decompressor: enter long mode, unpack vmlinux | 32-bit → 64-bit | `arch/x86/boot/compressed/` |
-| 6 | Kernel early entry: real page tables | 64-bit | `arch/x86/kernel/head_64.S`, `head64.c` |
-| 7 | `start_kernel()`: core subsystem init | 64-bit, PID 0 | `init/main.c` |
-| 8 | `rest_init()`: spawn PID 1 and kthreadd | 64-bit | `init/main.c` |
-| 9 | `kernel_init()`: initcalls, initramfs, exec `/init` | kernel → user | `init/main.c`, `init/initramfs.c` |
-| 10 | `/init` script → `exec /bin/sh` | user space | `build_initram.sh` (this repo) |
+| 4 | Switch to protected mode | 16 --> 32-bit | `arch/x86/boot/pm.c` |
+| 5 | Decompressor | 32 --> 64-bit | `arch/x86/boot/compressed/` |
+| 6 | Early 64-bit kernel | 64-bit | `arch/x86/kernel/head_64.S`, `head64.c` |
+| 7 | `start_kernel()` | 64-bit, PID 0 | `init/main.c` |
+| 8 | `rest_init()`: PID 1 and PID 2 | 64-bit | `init/main.c` |
+| 9 | `kernel_init()`: drivers, initramfs, exec `/init` | kernel --> user | `init/main.c`, `init/initramfs.c` |
+| 10 | `/init` --> `/bin/sh` | user space | `build_initram.sh` (this repo) |
 
-### What the `bzImage` file is
+One idea ties every stage together. The **CPU mode goes up one step at a time** (16 --> 32 --> 64-bit).
+Each stage also **adds what it learned to one structure**, `struct boot_params` (the "zero page"), and passes
+it on to the next stage. The pointer to it travels in `%esi`/`%rsi` all the way into the 64-bit kernel.
 
-Knowing how the image is built makes stages 3–6 easier to follow. `arch/x86/boot/Makefile:64`:
+### What `bzImage` contains
 
-```make
-$(obj)/bzImage: $(obj)/setup.bin $(obj)/vmlinux.bin FORCE
-	$(call if_changed,image)
-```
-
-and `cmd_image` (`arch/x86/boot/Makefile:61`) just concatenates them:
-
-```make
-cmd_image = (dd if=$< bs=4k conv=sync status=none; cat $(filter-out $<,$(real-prereqs))) >$@
-```
-
-So `bzImage` = **`setup.bin`** (16-bit real-mode code, built from `arch/x86/boot/*.c,*.S`)
-followed by **`vmlinux.bin`**, the binary of `arch/x86/boot/compressed/vmlinux`. That one is the
-**decompressor** with the real kernel embedded as a compressed blob (`piggy.o`, generated by
-`arch/x86/boot/compressed/mkpiggy.c`, which emits the `input_data` / `z_input_len` symbols at lines 53–61).
+`arch/x86/boot/Makefile:61-64` builds `bzImage` by concatenating two pieces:
 
 ```
 bzImage
-├── setup.bin              ← stage 3/4  (real mode, loaded below 1 MiB)
-└── vmlinux.bin            ← loaded at 0x100000
-    ├── decompressor code  ← stage 5    (startup_32 / startup_64 / extract_kernel)
-    └── piggy: compressed(vmlinux.bin + relocs)  ← the real kernel, stage 6+
+├── setup.bin     16-bit setup code + setup header       --> stages 3-4
+└── vmlinux.bin   decompressor + compressed real kernel  --> stage 5, then 6+
 ```
+
+The compressed kernel is embedded as `piggy.o` (generated by `arch/x86/boot/compressed/mkpiggy.c`).
 
 ---
 
-## The three paths at a glance
+## Stage 0 - CPU reset
 
-Where each path **enters the kernel**, and which kernel stages it skips as a result:
+After power-on or RESET, an x86 CPU starts in 16-bit real mode. Its first instruction is fetched from
+physical address **`0xFFFFFFF0`**, 16 bytes below 4 GiB, where the board maps the firmware flash chip.
 
-```
-                      CPU reset @ 0xFFFFFFF0 (all paths)
-                                   │
-          ┌────────────────────────┼─────────────────────────────┐
-     SeaBIOS POST             BIOS POST                  UEFI SEC→PEI→DXE→BDS
-          │                        │                             │
-   QEMU linuxboot ROM     MBR @0x7C00 → GRUB core.img    \EFI\...\*.EFI from ESP (FAT)
-   (fw_cfg, no disk)      → reads /boot/vmlinuz          (GRUB / systemd-boot / bzImage itself)
-          │                 │ linux16      │ linux             │
-          ▼                 ▼              │                   │
-   Stage 3: header.S _start (16-bit)       │                   │
-            main.c, pm.c, pmjump.S         │                   │
-          │                                ▼                   │
-          └──────────► Stage 5: compressed/head_64.S           │
-                       startup_32 (32-bit) → startup_64        ▼
-                       → extract_kernel()            efi_pe_entry() → efi_stub_entry()
-                                   │                 (x86-stub.c, 64-bit, firmware services alive)
-                                   │                 → efi_decompress_kernel() → ExitBootServices()
-                                   ▼                   │
-                       Stage 6: kernel/head_64.S startup_64  ◄──┘
-                                   │
-                       Stage 7–10: start_kernel() … /bin/sh   (identical for all paths)
-```
-
-| | **QEMU `-kernel`** (this repo) | **BIOS + GRUB `linux`** | **UEFI + EFI stub** |
-|---|---|---|---|
-| Firmware | SeaBIOS (emulated hardware, no real POST work) | vendor BIOS / CSM | UEFI (PI phases SEC→PEI→DXE→BDS) |
-| How the boot target is found | none: QEMU already has the file on the **host** | INT 19h → read sector 0 of the boot disk to `0x7C00`, check `0xAA55` | `BootOrder`/`Boot####` NVRAM variables, or the fallback `\EFI\BOOT\BOOTX64.EFI` on the ESP |
-| Who reads `bzImage` from storage | QEMU process (host) → fw_cfg DMA | GRUB, using its own filesystem drivers (ext4, xfs, …) | firmware (FAT on the ESP), or GRUB/systemd-boot |
-| Boot protocol | 16-bit (`boot.rst` "Running the Kernel") | **32-bit** (`boot.rst:1324`); `linux16` = 16-bit | **PE/COFF entry** (`efi_pe_entry`); the EFI handover protocol is deprecated |
-| CPU mode at kernel entry | 16-bit real mode | 32-bit protected, paging off | **64-bit long mode, paging on** (set up by firmware) |
-| First kernel instruction | `header.S` `_start` (setup.bin) | `compressed/head_64.S` `startup_32` | `efi_pe_entry()` in `libstub/x86-stub.c` |
-| Who builds `boot_params` | kernel `main.c` (from header filled by QEMU) | **GRUB** | **kernel EFI stub** (`efi_allocate_bootparams`) |
-| Memory map source | BIOS `INT 15h E820`, queried by kernel `memory.c` | BIOS E820, queried by **GRUB** | UEFI `GetMemoryMap()`, converted to e820 by the stub (`setup_e820`) |
-| Runs `arch/x86/boot/` 16-bit setup? | **yes** | **no** | **no** |
-| Runs `compressed/head_64.S`? | yes | yes | **no**: the stub decompresses and jumps straight to Stage 6 |
-| Who loads the initrd | QEMU (fw_cfg) | GRUB (`initrd` command) | stub via `LoadFile2` + `LINUX_EFI_INITRD_MEDIA_GUID`, or `initrd=` on the ESP, or bootloader |
-| Firmware after the kernel starts | BIOS left behind, never called again | same | **UEFI runtime services stay callable** (variables, time, reset) |
-| Secure Boot | n/a | n/a | firmware verifies the PE signature (usually shim → GRUB → kernel) |
-
-The three facts to remember:
-
-- **QEMU `-kernel` is not a disk boot.** There is no MBR, no partition table, no bootloader, and no filesystem driver.
-  The host QEMU process reads `bzImage` from your Mac/Linux filesystem and copies it straight into guest RAM.
-  On real hardware *something* in the firmware or a bootloader has to find the kernel on a disk. That
-  "something" is most of the complexity QEMU removes.
-- **Only the QEMU path (and GRUB's `linux16`) runs the kernel's 16-bit setup code.** A typical GRUB
-  `linux` boot on a BIOS machine starts at `startup_32`. A UEFI boot starts in 64-bit mode inside the EFI stub.
-  Stages 3–4 below are the path *least* used on modern real hardware.
-- **On UEFI the kernel is its own bootloader.** `bzImage` is a valid PE/COFF executable (`header.S:44-86`),
-  so the firmware can run it directly. The stub does the jobs that the BIOS-era real-mode setup and the bootloader used to do.
-
----
-
-# Part I — The QEMU `-kernel` path, stage by stage
-
-## Stage 0 — CPU reset
-
-When power comes up or RESET is asserted, an x86 CPU starts in 16-bit real mode and fetches its
-first instruction at physical address `0xFFFFFFF0`, 16 bytes below 4 GiB. The motherboard maps the
-firmware flash chip there.
-
-The Intel 80386 Programmer's Reference Manual §10.2.3 says:
 > "the address lines A{31-20} are automatically asserted for instruction fetches. This fact, together with the initial values of CS:IP, causes instruction execution to begin at physical address FFFFFFF0H."
+> ([Intel 80386 PRM §10.2](https://courses.cs.washington.edu/courses/cse451/23wi/documentation/i386/s10_02.htm))
 
-([80386 PRM, ch. 10.2](https://courses.cs.washington.edu/courses/cse451/23wi/documentation/i386/s10_02.htm))
+The instruction there is a jump into the BIOS.
 
-Modern Intel SDMs keep this behavior (Vol. 3A, "First Instruction Executed"). The hidden CS base is
-`0xFFFF0000` and IP is `0xFFF0`. I did not fetch the current SDM PDF, so check the exact section
-number there if you need it.
+## Stage 1 - BIOS: what happens inside
 
-No kernel code involved.
+The BIOS is the firmware that runs before any OS. It has **two jobs**: put the machine into a known state,
+then find something to boot. QEMU's default BIOS is SeaBIOS. Its docs split the work into phases
+([Execution and code flow](https://github.com/coreboot/seabios/blob/master/docs/Execution_and_code_flow.md)).
 
-## Stage 1 — BIOS (SeaBIOS) POST
+### 1a. POST (Power On Self Test)
 
-QEMU's default firmware for the `pc`/`q35` machines is SeaBIOS. From the SeaBIOS docs
-([Execution and code flow](https://github.com/coreboot/seabios/blob/master/docs/Execution_and_code_flow.md)):
+> "initialize internal state, initialize external interfaces, detect and setup hardware"
 
-> "On emulators, this phase starts when the CPU starts execution in 16bit mode at 0xFFFF0000:FFF0. […] SeaBIOS arranges for romlayout.S:reset_vector() to be present there."
+In SeaBIOS this is `maininit()` in [`src/post.c`](https://github.com/coreboot/seabios/blob/master/src/post.c). In order, it:
 
-> "The Power On Self Test (POST) phase is the initialization phase of the BIOS. […] initialize internal state, initialize external interfaces, detect and setup hardware"
+1. **Relocates and sets up its own memory.** The BIOS starts running from read-only flash, so it first prepares
+   writable memory and a small allocator for itself (`dopost()`, `malloc_init()`).
+2. **Builds the real-mode interfaces** (`interface_init()`):
+   - the **Interrupt Vector Table (IVT)** at address 0. This is the table that makes `INT 10h` (video),
+     `INT 13h` (disk), `INT 15h` (system/memory), `INT 16h` (keyboard), and others work (`ivt_init()`);
+   - the **BIOS Data Area (BDA)**, a small block of low memory that describes the hardware (`bda_init()`);
+   - keyboard, mouse, and PnP/PMM services that boot code can call.
+3. **Initializes the base PC hardware** (`platform_hardware_setup()`): the legacy DMA controller, the interrupt controller (PIC),
+   timers and the clock, the TPM, and platform-specific setup (on QEMU, it reads the machine configuration from QEMU).
+4. **Initializes devices** (`device_hardware_setup()`): keyboard, disks, USB, and so on.
+5. **Runs option ROMs.** Add-in cards carry their own small firmware, called an *option ROM*. The VGA ROM runs first,
+   so the screen works (`vgarom_setup()`), then all the others (`optionrom_setup()`). An option ROM can register
+   itself as a **boot device**. **QEMU's `-kernel` loader is one of these ROMs** (see Stage 2).
+6. **Lets the user change the boot order** (the "Press ESC for boot menu" prompt, `interactive_bootmenu()`).
+7. **Finalizes data for the OS** (`prepareboot()`). This includes the **e820 memory map** (`e820_prepboot()`):
+   the list of usable and reserved RAM ranges. Linux asks for it later with `INT 15h, AX=E820h`.
+8. **Write-protects the BIOS** and starts the boot phase:
+   > "SeaBIOS invokes an "int 0x19" software interrupt in 16bit mode"
 
-POST does the following:
-- builds the memory map that the kernel later queries with `INT 15h, AX=E820h`;
-- installs the real-mode interrupt vector table (`INT 10h` video, `INT 13h` disk, `INT 15h` system, …);
-- scans and runs **option ROMs**, including the one QEMU injects for `-kernel`.
+**On real hardware** POST is much heavier. The hardest early job is **bringing up DRAM**: until the memory
+controller is trained, the firmware runs without RAM, using only the CPU cache. It also initializes the chipset,
+trains PCIe links, and loads CPU microcode. On QEMU, RAM simply works, so none of this is visible.
 
-At the end:
-> "SeaBIOS invokes an "int 0x19" software interrupt in 16bit mode"
+### 1b. Boot phase (`INT 19h`)
 
-which enters the boot phase (`romlayout.S:entry_19()` → `boot.c:handle_19()`).
+> "load the first portion of the operating system's boot loader into memory"
 
-> **QEMU vs. real hardware.** On QEMU, POST is short because the hardware is emulated. RAM works from the
-> first instruction, and SeaBIOS gets the machine's configuration from QEMU. On a real board, the firmware's
-> hardest early job is bringing up DRAM: until the memory controller is initialized, it runs with no RAM,
-> only CPU cache. The UEFI PI spec gives this its own phase (PEI, "Initializing some permanent memory complement",
-> see [Path B](#path-b--uefi)). It also has to train PCIe links, initialize the chipset, and apply CPU microcode updates.
-> None of this is visible in a QEMU boot log.
+The BIOS walks its boot order and tries each entry
+(`boot.c`, [source](https://github.com/coreboot/seabios/blob/master/src/boot.c)):
+- **Disk**: read sector 0 (the 512-byte MBR) to `0x7C00` with `INT 13h`, check the `0xAA55` signature, and jump there.
+- **Option ROM** (a "BEV" entry): jump to the entry point the ROM registered. QEMU prints `Booting from ROM...`.
 
-No kernel code involved.
+### 1c. After boot
 
-## Stage 2 — The "bootloader": QEMU's linuxboot option ROM
+The BIOS stays in memory as a set of **legacy services** (`INT xx` calls). Early 16-bit code can call them.
+Linux uses them only in Stage 3 and **never calls them again** once it leaves real mode.
 
-On a real disk boot, the BIOS loads a 512-byte boot sector to `0x7C00`, and that boot sector (GRUB stage 1)
-loads the kernel. With `-kernel`, QEMU does that job itself, in two halves.
+## Stage 2 - QEMU loads the kernel (no disk involved)
 
-**Host side (QEMU process)**: `x86_load_linux()` in
-[`hw/i386/x86-common.c`](https://github.com/qemu/qemu/blob/master/hw/i386/x86-common.c)
-reads the bzImage header and checks the magic:
+With `-kernel`, there is **no MBR and no bootloader**. QEMU does the bootloader's job in two halves:
 
-```c
-if (ldl_le_p(header + 0x202) == 0x53726448) /* Magic signature "HdrS" */ {
-    protocol = lduw_le_p(header + 0x206);
-```
+- **Host side**: `x86_load_linux()` in [`hw/i386/x86-common.c`](https://github.com/qemu/qemu/blob/master/hw/i386/x86-common.c)
+  reads `bzImage` from *your* filesystem, checks the `HdrS` magic, and fills in the setup header
+  (load addresses, command line, initrd location, `type_of_loader = 0xB0`).
+- **Guest side**: the option ROM [`linuxboot_dma.c`](https://github.com/qemu/qemu/blob/master/pc-bios/optionrom/linuxboot_dma.c)
+  copies the setup code (to `0x10000`), the kernel (to `0x100000`), the initrd, and the command line into guest RAM
+  over QEMU's **fw_cfg** paravirtual device. It then jumps into the kernel.
 
-For a modern kernel it picks:
+The rules for this handoff are the **Linux boot protocol**, `Documentation/arch/x86/boot.rst` (memory layout at line 146,
+"Running the Kernel" at line 1255):
 
-```c
-/* High and recent kernel */
-real_addr = 0x10000;
-cmdline_addr = 0x20000;
-prot_addr = 0x100000;
-```
-
-It also sets `type_of_loader` (`header[0x210] = 0xB0;`, "High nybble = B reserved for QEMU"), and
-registers the option ROM: `option_rom[nb_option_roms].name = "linuxboot_dma.bin";`.
-
-**Guest side (option ROM, runs under SeaBIOS)**:
-[`pc-bios/optionrom/linuxboot_dma.c`](https://github.com/qemu/qemu/blob/master/pc-bios/optionrom/linuxboot_dma.c)
-pulls the pieces into guest RAM over the fw_cfg DMA interface
-(`FW_CFG_SETUP_DATA`, `FW_CFG_KERNEL_DATA`, `FW_CFG_INITRD_DATA`, `FW_CFG_CMDLINE_DATA`),
-then jumps into the kernel:
-
-```c
-segment_addr = ((uint32_t)setup_addr >> 4);
-...
-"movw %%ax, %%ds\n" ... "movw %%ax, %%ss\n"
-"movl %%ebx, %%esp\n"
-"addw $0x20, %%ax\n"
-"pushw %%ax\n" /* CS */
-"pushw $0\n"   /* IP */
-...
-"lretw\n"
-```
-
-This follows the kernel's documented contract. `Documentation/arch/x86/boot.rst` ("Running the Kernel", line 1255):
-
-> "The kernel is started by jumping to the kernel entry point, which is located at *segment* offset 0x20 from the start of the real mode kernel. […] At entry, ds = es = ss should point to the start of the real-mode kernel code […] and interrupts should be disabled."
-
-Resulting memory layout (protocol ≥ 2.02, `boot.rst:146`):
-
-```
-  100000  +------------------------+
-          |  Protected-mode kernel |   ← vmlinux.bin (decompressor + piggy)
-  0A0000  +------------------------+
-          ~  ...                   ~
-  X+10000 |  Command line          |   ← QEMU: 0x20000
-  X+08000 |  Stack/heap            |
-          |  Kernel setup          |   ← setup.bin, X = 0x10000 for QEMU
-  X       +------------------------+
-```
-
-`boot.rst:1185` "Loading The Rest of The Kernel" also says:
-> "It should be loaded at address 0x10000 for Image/zImage kernels and 0x100000 for bzImage kernels."
-
-**How SeaBIOS reaches the option ROM.** Option ROMs can register a *Bootstrap Entry Vector* (BEV).
-SeaBIOS's boot phase (`src/boot.c`, [source](https://github.com/coreboot/seabios/blob/master/src/boot.c))
-dispatches each boot-list entry by type. For a ROM:
-
-```c
-case IPL_TYPE_BEV:
-    boot_rom(ie->vector);
-...
-    printf("Booting from ROM...\n");
-    ...
-    call_boot_entry(so, 0);
-```
-
-This is the `Booting from ROM...` line that QEMU prints before the kernel output. I verified the SeaBIOS side.
-I did not check in QEMU's `optionrom.h` that `linuxboot_dma.bin` registers itself as a BEV, but the printed message is consistent with it.
-
-Compare this with a disk boot in the same function (`boot_disk`), which is what [Path A](#path-a--legacy-bios-from-a-disk-mbr--grub) uses
-and what QEMU `-kernel` **skips**:
-
-```c
-u16 bootseg = 0x07c0;
-...
-br.ah = 2;  br.al = 1;  br.cl = 1;   // INT 13h: read 1 sector, sector 1
-call16_int(0x13, &br);
-...
-if (GET_FARVAR(bootseg, mbr->signature) != MBR_SIGNATURE) {
-    printf("Boot failed: not a bootable disk\n\n");
-```
+> "The kernel is started by jumping to the kernel entry point, which is located at *segment* offset 0x20 from the start of the real mode kernel."
 
 ---
 
-## Stage 3 — Kernel real-mode setup (`arch/x86/boot/`)
+## Stage 3 - Kernel real-mode setup
 
 From here on, everything is kernel code.
 
-### 3a. The setup header — `arch/x86/boot/header.S`
+- **Setup header** - `arch/x86/boot/header.S:233-541`. This is the data the bootloader reads and fills in:
+  `code32_start`, `ramdisk_image`/`ramdisk_size`, `cmd_line_ptr`, `loadflags`, and others.
+  With `CONFIG_EFI_STUB`, the file also starts with a PE header (`header.S:44`), so UEFI can run it (see the last section).
+- **Entry** - `_start` at `header.S:245`, then `start_of_setup` (`header.S:547`). This sets up segments and a stack,
+  checks that setup was fully loaded, clears BSS, and calls `main()`.
+- **`main()`** - `arch/x86/boot/main.c:133`. 16-bit C, and the **last chance to ask the BIOS anything**:
+  - copies the setup header into `boot_params` (`copy_boot_params()`, `main.c:30`);
+  - checks that the CPU supports long mode (`validate_cpu()`, `cpucheck.c`);
+  - **gets the memory map** from the BIOS with `INT 15h E820` (`detect_memory_e820()`, `memory.c:18`);
+  - queries keyboard, EDD, and APM, and sets the video mode with `INT 10h` (`set_video()`);
+  - calls `go_to_protected_mode()`.
 
-The first sector of `bzImage` is a data structure, the **setup header**, which the bootloader reads and fills in.
-With `CONFIG_EFI_STUB` it also starts with an `MZ`/PE header (`header.S:44`), which lets UEFI firmware load the same file as an EFI application.
+## Stage 4 - Switch to 32-bit protected mode
 
-`header.S:233-241` (offset `0x1F1` in the file):
+`go_to_protected_mode()` - `arch/x86/boot/pm.c:103`:
+- disables interrupts and masks the PIC;
+- enables the **A20 line** (`a20.c`), so addresses above 1 MiB do not wrap around;
+- loads a minimal flat GDT (`setup_gdt()`, `pm.c:65`);
+- calls `protected_mode_jump()` (`pmjump.S:24`), which sets `CR0.PE` and jumps to `code32_start` (`0x100000`),
+  passing `boot_params` in `%esi`.
 
-```asm
-	.globl	hdr
-hdr:
-		.byte setup_sects - 1
-root_flags:	.word ROOT_RDONLY
-syssize:	.long ZO__edata / 16
-...
-boot_flag:	.word 0xAA55
-```
+## Stage 5 - The decompressor
 
-`header.S:245-254`: offset 512 is the **real entry point** (the target of `seg+0x20 : 0`), a 2-byte jump over the rest of the header:
+The real kernel is still compressed. Code in `arch/x86/boot/compressed/`:
 
-```asm
-	# offset 512, entry point
-	.globl	_start
-_start:
-		.byte	0xeb		# short (2-byte) jump
-		.byte	start_of_setup-1f
-1:
-		.ascii	"HdrS"		# header signature
-		.word	0x020f		# header version number (>= 0x0105)
-```
+- **`startup_32`** - `compressed/head_64.S:82`. Builds identity-mapped page tables for the first 4 GiB,
+  enables PAE and `EFER.LME`, turns on paging, and so **enters 64-bit long mode** (`head_64.S:268-277`).
+- **`startup_64`** - `compressed/head_64.S:282`. Moves the compressed image to the end of the buffer,
+  so decompressing in place is safe, then calls `extract_kernel()`.
+- **`extract_kernel()`** - `compressed/misc.c:407`:
+  - picks a random load address (**KASLR**, `choose_random_location()`, `kaslr.c:864`);
+  - decompresses (gzip/xz/zstd, depending on config), lays out the ELF segments, and applies relocations
+    (`decompress_kernel()`, `misc.c:344`);
+  - prints `Decompressing Linux... done.` and returns the address of the real kernel's entry point.
 
-Fields the bootloader fills in, which the kernel reads later:
-- `type_of_loader` — `header.S:268`
-- `loadflags` (`LOADED_HIGH`, `CAN_USE_HEAP`) — `header.S:274`
-- `code32_start` — `header.S:284`, defaults to `0x100000`. **This is where stage 4 jumps.**
-- `ramdisk_image` / `ramdisk_size` — `header.S:288`, where QEMU placed `initramfs.cpio.gz`
-- `cmd_line_ptr` — `header.S:309`, points at `"console=ttyS0"`
-- `kernel_alignment`, `relocatable_kernel`, `pref_address`, `init_size` — `header.S:332-540`
+## Stage 6 - The real kernel starts
 
-### 3b. `start_of_setup` — `header.S:547-600`
+- **`startup_64`** - `arch/x86/kernel/head_64.S:38`. Sets up the early GDT/IDT, builds page tables that map the kernel
+  at its high virtual address (`0xffffffff8...`, `__startup_64()` in `arch/x86/boot/startup/map_kernel.c:87`),
+  and jumps there. It then calls into C through `initial_code` (`head_64.S:479`).
+- **`x86_64_start_kernel()`** - `arch/x86/kernel/head64.c:222`. Clears BSS, installs early exception handlers,
+  and **copies `boot_params` and the command line** into the kernel's own variables (`copy_bootdata()`, `head64.c:194`).
+  It then calls `start_kernel()`.
 
-This is the first kernel instruction to run. It sets up a usable real-mode C environment:
+From here the boot is mostly architecture-independent.
 
-```asm
-start_of_setup:
-# Force %es = %ds
-	movw	%ds, %ax
-	movw	%ax, %es
-	cld
-	...                         # fix up %ss:%sp if the loader left it bad
-	sti			# Now we should have a working stack
+## Stage 7 - `start_kernel()` - `init/main.c:987`
 
-# We will have entered with %cs = %ds+0x20, normalize %cs so
-# it is on par with the other segments.
-	pushw	%ds
-	pushw	$6f
-	lretw
-6:
-# Check signature at end of setup
-	cmpl	$0x5a5aaa55, setup_sig      # detects a truncated load
-	jne	setup_bad
-# Zero the bss
-	movw	$__bss_start, %di
-	...
-	rep stosl
-# Jump to C code (should not return)
-	calll	main
-```
+Runs on CPU 0 as PID 0. It brings up the core of the kernel, in roughly this order:
 
-`setup_sig` is placed at the end of setup by the linker script (`arch/x86/boot/setup.ld:43`).
-If the bootloader loaded too few sectors, the check fails and `"No setup signature found..."` is printed.
+- prints the `Linux version ...` banner (`main.c:1008`);
+- **`setup_arch()`** (`arch/x86/kernel/setup.c:884`): turns the e820 table into the kernel's memory map
+  (`e820__memory_setup()`, `:975`), maps all RAM (`init_mem_mapping()`, `:1138`), reserves the initrd (`:1185`),
+  and reads ACPI tables (`:1189`);
+- memory allocators (`mm_core_init()`, `:1049`), scheduler (`sched_init()`, `:1062`), interrupts and timers;
+- **enables interrupts** (`local_irq_enable()`, `:1118`) and starts the real console (`console_init()`, `:1127`);
+- creates the initial in-memory root filesystem, **rootfs** (`vfs_caches_init()`, `:1172`);
+- calls `rest_init()` (`:1190`), which never returns.
 
-### 3c. `main()` — `arch/x86/boot/main.c:133`
+## Stage 8 - `rest_init()` - `init/main.c:681`
 
-This is 16-bit C (compiled with `-m16`). It still runs in real mode, so it can call BIOS interrupts
-(`intcall()` in `arch/x86/boot/bioscall.S`). This is the last chance to ask the BIOS anything.
+Creates the first processes:
+- **PID 1**: a kernel thread running `kernel_init()`. It becomes user space later.
+- **PID 2**: `kthreadd`, the parent of every later kernel thread (`:710`).
+- **PID 0** turns into CPU 0's idle loop (`cpu_startup_entry()`, `:732`).
 
-```c
-void main(void)
-{
-	init_default_io_ops();
-	/* First, copy the boot header into the "zeropage" */
-	copy_boot_params();                         // main.c:30
-	/* Initialize the early-boot console */
-	console_init();
-	...
-	init_heap();
-	/* Make sure we have all the proper CPU support */
-	if (validate_cpu()) { ... die(); }          // cpucheck.c: long mode? SSE? ...
-	set_bios_mode();
-	/* Detect memory layout */
-	detect_memory();                            // memory.c
-	keyboard_init();
-	query_ist();
-	if (IS_ENABLED(CONFIG_APM)) query_apm_bios();
-	if (IS_ENABLED(CONFIG_EDD)) query_edd();
-	/* Set the video mode */
-	set_video();                                // video*.c, INT 10h
-	/* Do the last things and invoke protected mode */
-	go_to_protected_mode();
-}
-```
+## Stage 9 - `kernel_init()`: from kernel thread to user space
 
-Key output: **`struct boot_params`**, the "zero page", a 4 KiB structure (`BUILD_BUG_ON(sizeof(boot_params) != 4096)`, `main.c:38`).
-It carries everything learned so far into the 64-bit kernel: the setup header, the e820 memory map,
-video info, EDD, the initrd location, and the command line pointer.
+- **`kernel_init_freeable()`** - `init/main.c:1646`:
+  - starts the other CPUs (`smp_init()`, `:1667`);
+  - runs **every `*_initcall()`** (`do_initcalls()`, `main.c:1427`). This is where all built-in drivers probe:
+    serial, PCI, block, filesystems;
+  - one of those initcalls **unpacks the initramfs** into rootfs (`populate_rootfs()`, `init/initramfs.c:789`).
+    It unpacks the small initramfs built into the kernel (which provides `/dev/console`), then the one QEMU loaded.
+    The format is cpio newc, the same format `build_initram.sh` writes;
+  - opens `/dev/console` as fd 0, 1, and 2 (`console_on_rootfs()`, `main.c:1632`).
+- **`kernel_init()`** - `init/main.c:1554`: frees init memory, makes kernel text read-only, and then
+  **execs `/init`** (`run_init_process()`, `main.c:1472`). If that fails, it tries `/sbin/init`, ..., `/bin/sh`, and finally panics.
+  When `execve` succeeds, PID 1 returns into **user mode**.
 
-The most important BIOS query is the memory map, in `arch/x86/boot/memory.c:18`:
+## Stage 10 - User space
 
-```c
-static void detect_memory_e820(void)
-{
-	struct boot_e820_entry *desc = boot_params.e820_table;
-	...
-	ireg.ax  = 0xe820;          // INT 15h, AX=E820h
-	...
-	} while (ireg.ebx && count < ARRAY_SIZE(boot_params.e820_table));
-	boot_params.e820_entries = count;
-```
+`/init` (written by `build_initram.sh`) is a shell script: it mounts `/proc` and `/sys`, then runs `exec /bin/sh`.
+The kernel handles the `#!` line (`fs/binfmt_script.c`) and loads the BusyBox ELF (`fs/binfmt_elf.c`).
+The shell becomes PID 1, reading and writing `ttyS0`, which is your terminal.
+
+That is why `exit` panics the kernel: PID 1 must never exit (`"Attempted to kill init!"`, `kernel/exit.c:940`).
 
 ---
 
-## Stage 4 — Real mode → 32-bit protected mode
+## Real hardware: BIOS + GRUB and UEFI
 
-### `go_to_protected_mode()` — `arch/x86/boot/pm.c:103`
-
-```c
-void go_to_protected_mode(void)
-{
-	/* Hook before leaving real mode, also disables interrupts */
-	realmode_switch_hook();
-	/* Enable the A20 gate */
-	if (enable_a20()) { ... die(); }        // a20.c:128
-	/* Reset coprocessor (IGNNE#) */
-	reset_coprocessor();
-	/* Mask all interrupts in the PIC */
-	mask_all_interrupts();
-	/* Actual transition to protected mode... */
-	setup_idt();                            // empty IDT  (pm.c:94)
-	setup_gdt();                            // flat 4 GiB __BOOT_CS/__BOOT_DS (pm.c:65)
-	protected_mode_jump(boot_params.hdr.code32_start,
-			    (u32)&boot_params + (ds() << 4));
-}
-```
-
-- **A20**: on 8086 machines, addresses wrapped at 1 MiB. Bit 20 of the address bus must be
-  "ungated" before memory above 1 MiB can be reached.
-- **GDT**: protected mode needs segment descriptors. Flat 0–4 GiB code and data are enough.
-
-### `protected_mode_jump` — `arch/x86/boot/pmjump.S:24`
-
-```asm
-SYM_FUNC_START_NOALIGN(protected_mode_jump)
-	movl	%edx, %esi		# Pointer to boot_params table
-	...
-	movl	%cr0, %edx
-	orb	$X86_CR0_PE, %dl	# Protected mode
-	movl	%edx, %cr0
-
-	# Transition to 32-bit mode
-	.byte	0x66, 0xea		# ljmpl opcode
-2:	.long	.Lin_pm32		# offset
-	.word	__BOOT_CS		# segment
-```
-
-Then in 32-bit code (`pmjump.S:49-74`): load flat data segments, `ltr`/`lldt`, clear registers, and
-
-```asm
-	jmpl	*%eax			# Jump to the 32-bit entrypoint
-```
-
-`%eax` = `code32_start` = `0x100000`, the start of `vmlinux.bin`, which is the decompressor's `startup_32`.
-`%esi` = physical address of `boot_params`. **`%esi` (later `%rsi`/`%r15`) carries boot_params through every stage below.**
-
----
-
-## Stage 5 — The decompressor (`arch/x86/boot/compressed/`)
-
-The real kernel is still compressed. This stage enters 64-bit long mode, moves itself out of the way,
-decompresses, applies relocations (KASLR), and jumps to the real kernel.
-
-### 5a. `startup_32` — `arch/x86/boot/compressed/head_64.S:82`
-
-- Loads its own GDT (`head_64.S:108`) and computes where it is running (`%ebp`) and where it will be
-  decompressed to (`%ebx`, aligned to `LOAD_PHYSICAL_ADDR`, `head_64.S:153`).
-- **Enables PAE** (`head_64.S:167-170`):
-  ```asm
-	movl	%cr4, %eax
-	orl	$X86_CR4_PAE, %eax
-	movl	%eax, %cr4
-  ```
-- **Builds identity-mapped page tables for the first 4 GiB** with 2 MiB pages (`head_64.S:205-236`):
-  one PML4 entry, 4 PDPT entries, and 2048 PMD entries with flags `0x183` (Present | RW | PageSize | Global).
-- Loads them: `movl %eax, %cr3` (`head_64.S:239`).
-- **Sets EFER.LME** (Long Mode Enable) (`head_64.S:242-245`):
-  ```asm
-	movl	$MSR_EFER, %ecx
-	rdmsr
-	btsl	$_EFER_LME, %eax
-	wrmsr
-  ```
-- **Enables paging, which activates long mode**, and far-returns into 64-bit code (`head_64.S:268-277`):
-  ```asm
-	leal	rva(startup_64)(%ebp), %eax
-	pushl	$__KERNEL_CS
-	pushl	%eax
-	/* Enter paged protected Mode, activating Long Mode */
-	movl	$CR0_STATE, %eax
-	movl	%eax, %cr0
-	/* Jump from 32bit compatibility mode into 64bit mode. */
-	lret
-  ```
-
-### 5b. `startup_64` — `compressed/head_64.S:282`
-
-64-bit bootloaders (EFI handover, kexec) enter directly here, per the "64-bit Boot Protocol" in `boot.rst:1387`:
-> "the kernel is started by jumping to the 64-bit kernel entry point, which is the start address of loaded 64-bit kernel plus 0x200. At entry, the CPU must be in 64-bit mode with paging enabled."
-
-- Sets up an early IDT (`load_stage1_idt`, `head_64.S:380`) and 4/5-level paging (`configure_5level_paging`, `head_64.S:413`).
-- **Copies itself to the end of the decompression buffer** so decompressing in place cannot overwrite
-  the code that is running (`head_64.S:418-428`):
-  ```asm
-/*
- * Copy the compressed kernel to the end of our buffer
- * where decompression in place becomes safe.
- */
-	...
-	std
-	rep	movsq
-	cld
-  ```
-- Jumps to the relocated copy: `jmp *%rax` → `.Lrelocated` (`head_64.S:444-445`).
-
-### 5c. `.Lrelocated` — `compressed/head_64.S:449-479`
-
-```asm
-	call	load_stage2_idt
-	/* Pass boot_params to initialize_identity_maps() */
-	movq	%r15, %rdi
-	call	initialize_identity_maps        // ident_map_64.c: on-demand page faults map more memory
-	/* pass struct boot_params pointer and output target address */
-	movq	%r15, %rdi
-	movq	%rbp, %rsi
-	call	extract_kernel		/* returns kernel entry point in %rax */
-	movq	%r15, %rsi
-	jmp	*%rax
-```
-
-### 5d. `extract_kernel()` — `arch/x86/boot/compressed/misc.c:407`
-
-```c
-asmlinkage __visible void *extract_kernel(void *rmode, unsigned char *output)
-{
-	unsigned long virt_addr = LOAD_PHYSICAL_ADDR;
-	...
-	choose_random_location((unsigned long)input_data, input_len,     // misc.c:490 → kaslr.c:864
-				...);
-	debug_putstr("\nDecompressing Linux... ");
-	entry_offset = decompress_kernel(output, virt_addr, error);       // misc.c:521
-	debug_putstr("done.\nBooting the kernel (entry_offset: 0x");
-	...
-	return output + entry_offset;                                     // misc.c:536
-}
-```
-
-and `decompress_kernel()` (`misc.c:344`):
-
-```c
-	if (__decompress(input_data, input_len, NULL, NULL, outbuf, output_len, ...))
-	...
-	entry = parse_elf(outbuf);                          // misc.c:281: lay out ELF PT_LOAD segments
-	handle_relocations(outbuf, output_len, virt_addr);  // misc.c:198: fix up for KASLR
-```
-
-- `choose_random_location()` is **KASLR**: it picks a random physical (and virtual) load address,
-  avoiding the initrd, the command line, and other regions listed in `boot_params`.
-- `__decompress` is gzip/xz/zstd/… depending on `CONFIG_KERNEL_*`.
-- The return value is the address of the real kernel's `startup_64`.
-
----
-
-## Stage 6 — The real kernel's first instructions
-
-### 6a. `startup_64` — `arch/x86/kernel/head_64.S:38`
-
-This is the entry point of the real `vmlinux`. It runs from its physical address, but is linked at
-`__START_KERNEL_map` (`0xffffffff80000000`).
-
-```asm
-SYM_CODE_START_NOALIGN(startup_64)
-	...
-	call	__pi_startup_64_setup_gdt_idt     // head_64.S:74
-	...
-	call verify_cpu                         // head_64.S:98
-	...
-	call	__pi___startup_64                 // head_64.S:114
-	...
-	movq	%rax, %cr3                       // head_64.S:136: switch to early_top_pgt
-	jmp	*.Lcommon_startup_64(%rip)        // jump to the HIGH virtual address
-```
-
-`__startup_64()` (`arch/x86/boot/startup/map_kernel.c:87`) fills `early_top_pgt` so the kernel
-is mapped both 1:1 (identity) and at its high virtual address. After the indirect jump, RIP is in the
-`0xffffffff8…` range.
-
-`common_startup_64` (`head_64.S:198`) sets CR4, EFER.NX, CR0, the per-CPU GS base, a stack and an early IDT
-(`early_setup_idt`, `head_64.S:376`), then calls into C:
-
-```asm
-	/* Pass the boot_params pointer as first argument */
-	movq	%r15, %rdi
-.Ljump_to_C_code:
-	xorl	%ebp, %ebp	# clear frame pointer
-	callq	*initial_code(%rip)          // head_64.S:418
-	ud2
-...
-SYM_DATA(initial_code,	.quad x86_64_start_kernel)   // head_64.S:479
-```
-
-Secondary CPUs (SMP bring-up) also come through `secondary_startup_64` (`head_64.S:147`), with a different `initial_code`.
-
-### 6b. `x86_64_start_kernel()` — `arch/x86/kernel/head64.c:222`
-
-```c
-asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode_data)
-{
-	...
-	cr4_init_shadow();                 // :238
-	reset_early_page_tables();         // :241  drop the identity mapping
-	clear_bss();                       // :249
-	...
-	idt_setup_early_handler();         // :276
-	copy_bootdata(__va(real_mode_data)); // :281
-	...
-	x86_64_start_reservations(real_mode_data);  // :291 → start_kernel() at :310
-}
-```
-
-`copy_bootdata()` (`head64.c:194`) copies the zero page built in stage 3 into the kernel's own
-`boot_params` and copies the command line into `boot_command_line`:
-
-```c
-	memcpy(&boot_params, real_mode_data, sizeof(boot_params));
-	sanitize_boot_params(&boot_params);
-	cmd_line_ptr = get_cmd_line_ptr();
-	if (cmd_line_ptr) {
-		command_line = __va(cmd_line_ptr);
-		memcpy(boot_command_line, command_line, COMMAND_LINE_SIZE);
-	}
-```
-
-From here on the boot is architecture-independent, except for `setup_arch()`.
-
----
-
-## Stage 7 — `start_kernel()` — `init/main.c:987`
-
-This runs on the boot CPU as the "init_task" (PID 0, which later becomes the idle task).
-Interrupts stay off until `local_irq_enable()`. Main calls, in order:
-
-| Line | Call | Purpose |
-|------|------|---------|
-| 1006 | `boot_cpu_init()` | mark CPU 0 online/present |
-| 1008 | `pr_notice("%s", linux_banner)` | prints `Linux version 7.3.0-rc7 ...`, the first line on `ttyS0` |
-| 1009 | `setup_arch(&command_line)` | **x86 setup**, see below |
-| 1010 | `mm_core_init_early()` | |
-| 1016 | `setup_command_line()` | |
-| 1018 | `setup_per_cpu_areas()` | |
-| 1048 | `trap_init()` | real IDT: exceptions |
-| 1049 | `mm_core_init()` | buddy allocator and slab take over from memblock |
-| 1062 | `sched_init()` | runqueues; the current task becomes the idle task |
-| 1082 | `rcu_init()` | |
-| 1093–1094 | `early_irq_init()`, `init_IRQ()` | IRQ descriptors, APIC/IOAPIC |
-| 1095 | `tick_init()` | |
-| 1102–1103 | `timekeeping_init()`, `time_init()` | clocksources (TSC, HPET) |
-| 1118 | `local_irq_enable()` | **interrupts on** |
-| 1127 | `console_init()` | real console drivers (`console=ttyS0` was parsed by `console_setup`, `kernel/printk/printk.c:2625`) |
-| 1156 | `calibrate_delay()` | BogoMIPS |
-| 1172 | `vfs_caches_init()` | dentry/inode caches, mounts the initial **rootfs** (ramfs/tmpfs) |
-| 1190 | `rest_init()` | never returns |
-
-### `setup_arch()` — `arch/x86/kernel/setup.c:884`
-
-This is where x86 takes in the information collected by the real-mode code:
-
-| Line | Call | Purpose |
-|------|------|---------|
-| 909 | `printk("Command line: %s\n", boot_command_line)` | |
-| 948 | `idt_setup_early_traps()` | |
-| 949 | `early_cpu_init()` | CPUID, vendor quirks |
-| 975 | `e820__memory_setup()` | turns the **e820 table from stage 3** into the kernel's memory map |
-| 978 | `copy_edd()` | |
-| 989 | `parse_early_param()` | `early_param()` handlers (`earlyprintk=`, `mem=`, …) |
-| 1138 | `init_mem_mapping()` | direct map of all RAM (`PAGE_OFFSET`) |
-| 1185 | `reserve_initrd()` | protects QEMU's `ramdisk_image` range from the allocator (`setup.c:363`) |
-| 1189 | `acpi_boot_table_init()` | ACPI tables (MADT → CPUs/APICs, …) |
-
----
-
-## Stage 8 — `rest_init()`: the first processes — `init/main.c:681`
-
-```c
-static noinline void __ref __noreturn rest_init(void)
-{
-	struct kernel_clone_args init_args = {
-		.flags		= (CLONE_VM | CLONE_UNTRACED),
-		.fn		= kernel_init,
-		...
-	};
-	rcu_scheduler_starting();
-	/*
-	 * We need to spawn init first so that it obtains pid 1, ...
-	 */
-	pid = kernel_clone(&init_args);                 // PID 1 → kernel_init()
-	...
-	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);   // PID 2 :710
-	...
-	system_state = SYSTEM_SCHEDULING;               // :722
-	complete(&kthreadd_done);
-	schedule_preempt_disabled();
-	/* Call into cpu_idle with preempt disabled */
-	cpu_startup_entry(CPUHP_ONLINE);                // :732 → kernel/sched/idle.c:448
-}
-```
-
-- **PID 0** becomes the idle loop of CPU 0 (`cpu_startup_entry` → `do_idle()`), and stays there forever.
-- **PID 1** is still a kernel thread running `kernel_init()`. It becomes user space later with `execve`.
-- **PID 2** is `kthreadd`, the parent of all later kernel threads.
-
----
-
-## Stage 9 — `kernel_init()`: from PID 1 kernel thread to user space
-
-### 9a. `kernel_init_freeable()` — `init/main.c:1646`
-
-```c
-	smp_init();             // :1667  bring up the other CPUs (secondary_startup_64)
-	sched_init_smp();       // :1668
-	...
-	do_basic_setup();       // :1675
-	...
-	wait_for_initramfs();   // :1679
-	console_on_rootfs();    // :1680
-	...
-	ramdisk_command_access = init_eaccess(ramdisk_execute_command);   // "/init"
-	if (ramdisk_command_access != 0) {
-		...
-		ramdisk_execute_command = NULL;
-		prepare_namespace();          // no /init in initramfs → mount a real root= disk
-	}
-```
-
-`do_basic_setup()` (`main.c:1453`) calls `driver_init()` and then **`do_initcalls()`** (`main.c:1427`).
-These run every `*_initcall()` in the kernel, level by level (`initcall_levels[]`, `main.c:1382`;
-macros in `include/linux/init.h:284-307`). All built-in drivers probe here: the 8250 serial driver behind `ttyS0`,
-PCI, block devices, filesystems, and so on.
-
-### 9b. Unpacking the initramfs — `init/initramfs.c`
-
-One of those initcalls is:
-
-```c
-static int __init populate_rootfs(void)              // initramfs.c:789
-{
-	initramfs_cookie = async_schedule_domain(do_populate_rootfs, NULL,
-						 &initramfs_domain);
-	...
-}
-rootfs_initcall(populate_rootfs);                    // initramfs.c:798
-```
-
-`do_populate_rootfs()` (`:745`) → `unpack_initramfs()`, which first unpacks the initramfs built into the kernel image
-(`__initramfs_start`, `:723`; by default `usr/default_cpio_list`, see 9c) and then the external one QEMU loaded:
-
-```c
-	err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);   // :735
-```
-
-`unpack_to_rootfs()` (`:520`) is a small state machine that decompresses gzip and parses the **cpio newc**
-format, the same format `build_initram.sh` writes (`cpio -o -H newc | gzip`). It creates each file,
-directory, and symlink directly in the rootfs. The memory of `initrd_start` is then freed.
-
-After this, rootfs contains `/init`, `/bin/busybox`, `/bin/sh -> busybox`, `/proc`, and `/sys`.
-
-### 9c. File descriptors 0/1/2 — `console_on_rootfs()`, `main.c:1632`
-
-```c
-	struct file *file = filp_open("/dev/console", O_RDWR, 0);
-	...
-	init_dup(file);   // fd 0 stdin
-	init_dup(file);   // fd 1 stdout
-	init_dup(file);   // fd 2 stderr
-```
-
-`/dev/console` resolves to the console chosen by `console=ttyS0`, so the shell's I/O goes to QEMU's
-`-nographic` serial port, which is your terminal.
-
-**Note:** `build_initram.sh` does **not** create `/dev/console` in its cpio. It still works because
-of the **built-in** initramfs unpacked first (9b). When `CONFIG_INITRAMFS_SOURCE` is empty (the default),
-`usr/Makefile:24-27` builds `usr/default_cpio_list` into the kernel, and that file contains:
+QEMU `-kernel` is **not representative of real machines**: there is no disk, no bootloader, and no filesystem read
+inside the VM. All three paths start at the same reset vector and end in the same Stages 6-10. They differ in the middle.
 
 ```
-dir /dev 0755 0 0
-nod /dev/console 0600 0 0 c 5 1
-dir /root 0700 0 0
+                       CPU reset @ 0xFFFFFFF0
+                                 │
+        ┌────────────────────────┼──────────────────────────┐
+   SeaBIOS POST             BIOS POST                UEFI firmware
+   QEMU option ROM          MBR @0x7C00 --> GRUB     loads \EFI\...\*.EFI from the ESP
+        │                        │                          │
+   Stage 3-4 (16-bit)            │                          │
+        └──────────► Stage 5 (decompressor) ◄┘              │
+                                 │                 kernel EFI stub (64-bit)
+                                 ▼                          │
+                   Stage 6: kernel/head_64.S  ◄─────────────┘
+                                 │
+                   Stages 7-10 (same for all paths)
 ```
 
-If you ever set `CONFIG_INITRAMFS_SOURCE`, add `/dev/console` yourself, or PID 1 gets no stdin/stdout
-(`Warning: unable to open an initial console.`).
+### BIOS + GRUB
 
-### 9d. `kernel_init()` — `init/main.c:1554`: free init memory, exec
+1. POST as in Stage 1, with real DRAM, chipset, and PCIe work.
+2. `INT 19h` loads the **MBR** to `0x7C00`. An MBR has only 446 bytes for code, so GRUB boots in pieces:
+   `boot.img` (the MBR) --> `core.img` (stored after the MBR, or in a BIOS Boot Partition on GPT) --> modules --> `grub.cfg`.
+   GRUB has **its own filesystem drivers**, because the BIOS can only read raw sectors.
+3. GRUB's `linux` command uses the **32-bit boot protocol** (`boot.rst:1324`). GRUB itself queries the BIOS for the memory map,
+   builds `boot_params`, switches to protected mode, and jumps to `code32_start`. **Stages 3-4 are skipped**,
+   and the kernel starts at Stage 5. (`linux16` uses the 16-bit protocol and runs Stages 3-4, like QEMU.)
 
-```c
-	kernel_init_freeable();
-	async_synchronize_full();
-	system_state = SYSTEM_FREEING_INITMEM;
-	free_initmem();          // :1574  "Freeing unused kernel image (initmem) memory"
-	mark_readonly();         // :1575  W^X for kernel text/rodata
-	system_state = SYSTEM_RUNNING;
-	...
-	if (ramdisk_execute_command) {                       // "/init" (main.c:168, rdinit=)
-		ret = run_init_process(ramdisk_execute_command);
-		if (!ret)
-			return 0;
-		...
-	}
-	if (execute_command) { ... }                         // init= on cmdline
-	...
-	if (!try_to_run_init_process("/sbin/init") ||
-	    !try_to_run_init_process("/etc/init") ||
-	    !try_to_run_init_process("/bin/init") ||
-	    !try_to_run_init_process("/bin/sh"))
-		return 0;
-	panic("No working init found.  ...");
-```
+### UEFI
 
-`run_init_process()` (`main.c:1472`) calls `kernel_execve()` (`fs/exec.c:1968`), which goes to `bprm_execve()` (`fs/exec.c:1843`).
-When `execve` succeeds, the return from `kernel_init` does not go back into the kernel. It goes
-through `ret_from_fork` and **enters user mode**, at the entry point of the new program, with PID 1.
+1. The firmware runs its own phases (SEC --> PEI --> DXE --> BDS,
+   [EDK II §2.3](https://tianocore-docs.github.io/edk2-BuildSpecification/release-1.28/2_design_discussion/23_boot_sequence.html)).
+   Compared with a BIOS, it **switches the CPU to 64-bit mode itself**, **has drivers** (storage, FAT, USB, network, graphics),
+   and offers services as **C function tables** instead of `INT xx` calls.
+2. The boot manager reads the `BootOrder`/`Boot####` NVRAM variables and loads a **PE/COFF file** from the FAT
+   **EFI System Partition** (fallback: `\EFI\BOOT\BOOTX64.EFI`). It verifies the signature if Secure Boot is on.
+   No MBR, no `0x7C00`.
+3. That file may be shim/GRUB, systemd-boot, or **the kernel itself**. With `CONFIG_EFI_STUB`, `bzImage` is a valid
+   EFI application (`header.S:44-86`):
+   > "Since the EFI boot stub performs the jobs of a boot loader, in a certain sense it *IS* the boot loader."
+   > (`Documentation/admin-guide/efi-stub.rst`)
+4. The **EFI stub**, `efi_stub_entry()` in `drivers/firmware/efi/libstub/x86-stub.c:912`, replaces Stages 3-5:
+   it builds `boot_params` (`efi_allocate_bootparams()`, `:507`), decompresses the kernel with KASLR (`efi_decompress_kernel()`, `:835`),
+   loads the initrd, gets the framebuffer, converts the UEFI memory map to e820, calls `ExitBootServices()` (`exit_boot()`, `:757`),
+   and jumps straight to **Stage 6** (`enter_kernel()`, `:898`).
+5. Unlike a BIOS, UEFI **Runtime Services** (variables, time, reset) stay callable from Linux after boot.
+   They are what `efibootmgr` and `/sys/firmware/efi/efivars` use.
 
----
+### Summary
 
-## Stage 10 — User space: `/init` → `/bin/sh`
-
-The `/init` written by `build_initram.sh` is a **shell script**, not an ELF:
-
-```sh
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-exec /bin/sh
-```
-
-So `bprm_execve()` goes through two binary-format handlers:
-1. `load_script()` (`fs/binfmt_script.c:34`) sees `#!`, opens the interpreter (`open_exec(i_name)`, `:132`),
-   and restarts the exec with `/bin/sh /init`.
-2. `load_elf_binary()` (`fs/binfmt_elf.c:829`) maps the statically linked BusyBox ELF and sets the user-mode
-   registers to its entry point (`START_THREAD(elf_ex, regs, elf_entry, bprm->p)`, `:1376`).
-
-BusyBox runs as `sh` (selected through `argv[0]` / the symlink name), runs the two `mount` commands (`mount(2)` syscalls),
-and then `exec /bin/sh` **replaces PID 1** with an interactive BusyBox shell reading from fd 0, which is `/dev/console` → `ttyS0`.
-
-That is the prompt you see in the QEMU window.
-
-This is also why the README notes that typing `exit` panics the kernel: the shell *is* PID 1, and when
-PID 1 exits, `do_exit()` (`kernel/exit.c:906`) panics:
-
-```c
-		if (unlikely(is_global_init(tsk)))
-			panic("Attempted to kill init! exitcode=0x%08x\n", ...);   // kernel/exit.c:940
-```
-
----
-
-# Part II — Real-hardware boot paths
-
-Both paths below start at the same reset vector as [Stage 0](#stage-0--cpu-reset), and both end in the same
-`start_kernel()` → `/init` sequence as Stages 7–10. They differ in the middle: **who finds the kernel on disk,
-which CPU mode the kernel is entered in, and therefore which kernel entry code runs.**
-
-## Path A — Legacy BIOS from a disk (MBR + GRUB)
-
-### A1. Reset and POST
-
-Same reset vector as Stage 0. The vendor BIOS does real POST work (DRAM, chipset, PCIe, option ROMs
-of real cards such as GPU VBIOS and RAID/NIC ROMs), then raises `INT 19h`.
-
-### A2. BIOS → MBR at `0x7C00`
-
-**This is the step QEMU `-kernel` skips completely.** The BIOS walks its boot order, and for a disk it reads
-**sector 0 (the MBR, 512 bytes)** with `INT 13h` to `0000:7C00`. It checks the `0x55AA` signature in the last two bytes
-and jumps there with the boot drive number in `DL`. The SeaBIOS `boot_disk()` code is quoted in [Stage 2](#stage-2--the-bootloader-qemus-linuxboot-option-rom).
-
-The kernel's own memory-layout diagram documents the same entry point. `Documentation/arch/x86/boot.rst:111`:
-
-```
-  010000	+------------------------+
-		|  Boot loader		 |	<- Boot sector entry point 0000:7C00
-  001000	+------------------------+
-```
-
-The kernel **does not provide** this boot sector. In `bzImage`, the first sector holds the PE header
-(`header.S:44-226`, only with `CONFIG_EFI_STUB`) and the setup header, not boot code. Old kernels had a floppy boot sector here.
-Only the layout remains: `header.S:227` says *"This is part 1 of the header, from the old boot sector"*, and
-`boot_flag: .word 0xAA55` (`header.S:241`) sits where a boot sector's signature would be.
-
-### A3. GRUB stages
-
-An MBR has only 446 bytes for code (the rest is the partition table and signature), so GRUB 2 boots in pieces.
-From the GRUB manual ("Images" node):
-
-> boot.img: "On PC BIOS systems, this image is the first part of GRUB to start."
->
-> diskboot.img: "This image is used as the first sector of the core image when booting from a hard disk."
->
-> core.img: "It is built dynamically from the kernel image and an arbitrary list of modules by the grub-mkimage program."
-
-and from "BIOS installation", about where `core.img` lives:
-
-> "it can be embedded in the area between the MBR and the first partition"
-> (MBR disks), or in a dedicated **BIOS Boot Partition** on GPT disks: "GRUB can then be embedded into that partition without the risk of being overwritten by other software"
-
-So:
-
-```
-MBR (boot.img, 0x7C00) → diskboot.img → rest of core.img
-  → loads modules (part_msdos/part_gpt, ext2, …) → reads /boot/grub/grub.cfg → menu
-```
-
-(GRUB on i386-pc runs mostly in 32-bit protected mode and drops back to real mode for BIOS calls.
-I didn't verify this in GRUB's source, but it explains why it can hand over to the kernel in protected mode in A4.)
-
-GRUB needs **its own filesystem drivers**, because the BIOS only knows how to read raw sectors.
-QEMU `-kernel` needs none, because the host filesystem does the reading.
-
-### A4. GRUB `linux` → the kernel, using the **32-bit boot protocol**
-
-This is the most important difference from the QEMU path. GRUB's `linux` command on BIOS
-(`grub-core/loader/i386/linux.c`) does **not** jump to the kernel's 16-bit `_start`. The GRUB manual:
-
-> "With linux GRUB uses 32-bit protocol. Some BIOS services like APM or EDD aren't available with this protocol. In this case you need to use linux16"
-
-GRUB itself rejects kernels too old for that protocol:
-
-```c
-  if (lh.header != grub_cpu_to_le32_compile_time (GRUB_LINUX_I386_MAGIC_SIGNATURE)
-      || grub_le_to_cpu16 (lh.version) < 0x0203)
-    {
-      grub_error (GRUB_ERR_BAD_OS, "version too old for 32-bit boot"
-```
-
-It fills the e820 table itself, so the kernel's `detect_memory()` never runs:
-
-```c
-  if (grub_e820_add_region (ctx->params->e820_table, &ctx->e820_num,
-			    addr, size, type))
-```
-
-and boots straight into protected mode at `code32_start`, with `%esi` = boot_params:
-
-```c
-  state.esi = ctx.real_mode_target;
-  state.esp = ctx.real_mode_target;
-  state.eip = ctx.params->hdr.code32_start;
-  return grub_relocator32_boot (relocator, state, 0);
-```
-
-(I quoted these GRUB snippets from the [rhboot/grub2 mirror](https://github.com/rhboot/grub2/blob/master/grub-core/loader/i386/linux.c),
-Fedora's tree, because upstream Savannah cgit returned errors. The logic quoted is long-standing upstream code, but I have not compared the two line by line.)
-
-The kernel side of this contract is `Documentation/arch/x86/boot.rst:1324` ("32-bit Boot Protocol"):
-
-> "For machine with some new BIOS other than legacy BIOS, such as EFI, LinuxBIOS, etc, and kexec, the 16-bit real mode setup code in kernel based on legacy BIOS can not be used, so a 32-bit boot protocol needs to be defined."
->
-> "In 32-bit boot protocol, the first step in loading a Linux kernel should be to setup the boot parameters (struct boot_params, traditionally known as "zero page")."
-
-### A5. Where it rejoins
-
-| Kernel stage | QEMU `-kernel` | GRUB `linux` | GRUB `linux16` |
+| | QEMU `-kernel` (this repo) | BIOS + GRUB `linux` | UEFI + EFI stub |
 |---|---|---|---|
-| 3 — `header.S` / `main.c` (16-bit setup, BIOS calls) | runs | **skipped**, GRUB does the equivalent | runs |
-| 4 — `pm.c` / `pmjump.S` (real → protected) | runs | **skipped**, GRUB switched modes itself | runs |
-| 5 — `compressed/head_64.S` `startup_32` onward | runs | **entry point** | runs |
-| 6–10 | same | same | same |
+| Who reads `bzImage` | QEMU on the **host** | GRUB, from disk | firmware (FAT ESP) or bootloader |
+| CPU mode at kernel entry | 16-bit real | 32-bit protected | 64-bit long |
+| First kernel code | `header.S` `_start` (Stage 3) | `startup_32` (Stage 5) | `efi_pe_entry()` (EFI stub) |
+| Who builds `boot_params` | kernel `main.c` | GRUB | EFI stub |
+| Memory map source | BIOS E820 (asked by the kernel) | BIOS E820 (asked by GRUB) | UEFI `GetMemoryMap()` |
+| Firmware after boot | unused | unused | Runtime Services still callable |
 
-**What you lose with the 32-bit protocol:** anything that `main.c` gets through BIOS calls and that GRUB
-doesn't fill in: `query_edd()`, `query_apm_bios()`, `query_ist()`, `set_video()` mode switching (main.c:163-175).
-The GRUB manual line above is about exactly this.
-
----
-
-## Path B — UEFI
-
-### B1. Firmware phases
-
-Same reset vector. UEFI firmware (built on the UEFI Platform Initialization spec; EDK II/TianoCore is the
-reference implementation, and OVMF is its QEMU build) runs in phases. From the
-[EDK II Build Specification §2.3](https://tianocore-docs.github.io/edk2-BuildSpecification/release-1.28/2_design_discussion/23_boot_sequence.html):
-
-| Phase | What it does (quoted) |
-|---|---|
-| **SEC** | "Handling all platform restart events", "Creating a temporary memory store", "Serving as the root of trust in the system" |
-| **PEI** | "Initializing some permanent memory complement", "Describing the memory in Hand-Off Blocks (HOBs)" |
-| **DXE** | loads the drivers that make up most of the firmware (described from PEI's handoff state) |
-| **BDS** | "Initializing console devices", "Loading device drivers", "Attempting to load and execute boot selections" |
-| **TSL** | "The Transient System Load (TSL) is primarily the OS vendor provided boot loader." |
-| **RT** | Runtime Services, which survive into the OS |
-
-Key differences from BIOS, before any OS code runs:
-- The firmware switches the CPU to **64-bit long mode with paging** (identity-mapped) itself, early on.
-  There is no real mode left by the time a bootloader runs.
-- The firmware **has drivers**: storage, the **FAT** filesystem, USB, network, and graphics (GOP).
-  It can read files, not just sectors.
-- Services are **C function tables** (`EFI_BOOT_SERVICES`, `EFI_RUNTIME_SERVICES`) reached through the
-  *system table* pointer, not software interrupts like `INT 13h`/`INT 15h`.
-
-### B2. BDS finds a PE/COFF executable on the ESP
-
-There is no MBR and no `0x7C00`. The boot manager reads the `BootOrder` and `Boot####` NVRAM variables. Each one names a
-device path plus a file, usually on the **EFI System Partition** (ESP, a FAT partition), such as `\EFI\debian\shimx64.efi`.
-If an entry gives only a device, the UEFI spec (§3.5.1.1, as quoted by
-[U-Boot's implementation](https://lists.denx.de/pipermail/u-boot/2022-May/483315.html); I could not fetch uefi.org itself) says:
-
-> "the firmware must append a default file name in the form \EFI\BOOT\BOOT{machine type short-name}.EFI"
-
-which is `\EFI\BOOT\BOOTX64.EFI` on x86_64. The firmware loads that file as a PE/COFF image with `LoadImage()`,
-checks its signature if **Secure Boot** is on, and calls its entry point with `StartImage()`.
-
-What that file is depends on the setup:
-- **shim → GRUB (`grubx64.efi`) → kernel**: the common distro chain under Secure Boot.
-- **systemd-boot** or another EFI boot manager → kernel.
-- **The kernel itself** (`bzImage` copied to the ESP as `*.efi`), or a Unified Kernel Image. No bootloader at all.
-
-### B3. `bzImage` is a PE/COFF executable
-
-With `CONFIG_EFI_STUB=y` (it is in `arch/x86/configs/x86_64_defconfig:41`), the first bytes of
-`bzImage` are an MS-DOS/PE header, not the boot sector. `arch/x86/boot/header.S:44-86`:
-
-```asm
-#ifdef CONFIG_EFI_STUB
-	# "MZ", MS-DOS header
-	.word	IMAGE_DOS_SIGNATURE
-	.org	0x38
-	...
-	.long	LINUX_PE_MAGIC
-	.long	pe_header
-pe_header:
-	.long	IMAGE_NT_SIGNATURE
-	...
-	.long	setup_size + ZO_efi_pe_entry	# AddressOfEntryPoint
-```
-
-The same file is therefore **both** a Linux boot-protocol image (the `HdrS` header at `0x202`) and a valid EFI
-application. `Documentation/admin-guide/efi-stub.rst`:
-
-> "a kernel zImage/bzImage can masquerade as a PE/COFF image, thereby convincing EFI firmware loaders to load it as an EFI executable. […] Since the EFI boot stub performs the jobs of a boot loader, in a certain sense it *IS* the boot loader."
-
-There are three ways in, all ending in the same function:
-
-| Entry | Who uses it | Code |
-|---|---|---|
-| **PE entry point** (the preferred one) | firmware `StartImage()`, systemd-boot, modern GRUB | `efi_pe_entry()` — `drivers/firmware/efi/libstub/x86-stub.c:1047` |
-| **EFI handover protocol** (deprecated) | older GRUB `linuxefi`, some distro GRUB patches | `efi_handover_entry()` — `x86-stub.c:1054`; offset in `hdr.handover_offset` (`header.S:524-541`) |
-| 64-bit boot protocol (no stub) | kexec, custom loaders | compressed `startup_64` + `0x200`, `boot.rst:1387` |
-
-`boot.rst:1434` on the handover protocol:
-> "The EFI Handover Protocol is deprecated in favour of the ordinary PE/COFF entry point described below."
-
-### B4. The EFI stub — `efi_stub_entry()`, `x86-stub.c:912`
-
-This one function replaces Stage 3 (`main.c`), Stage 4 (`pm.c`), and Stage 5 (`compressed/head_64.S`) of the QEMU path.
-It runs **as an EFI application**, in 64-bit mode on the firmware's page tables, with Boot Services available.
-
-```c
-void __noreturn efi_stub_entry(efi_handle_t handle,
-			       efi_system_table_t *sys_table_arg,
-			       struct boot_params *boot_params)
-{
-	...
-	efi_system_table = sys_table_arg;
-	/* Check if we were booted by the EFI firmware */
-	if (efi_system_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
-		efi_exit(handle, EFI_INVALID_PARAMETER);
-
-	if (!IS_ENABLED(CONFIG_EFI_HANDOVER_PROTOCOL) || !boot_params) {
-		status = efi_allocate_bootparams(handle, &boot_params);   // :507
-	...
-	status = efi_setup_5level_paging();
-	...
-	status = parse_options((char *)cmdline_paddr);
-	...
-	status = efi_decompress_kernel(&kernel_entry, boot_params);   // :835
-	...
-	status = efi_load_initrd(image, hdr->initrd_addr_max, ULONG_MAX, &initrd);
-	...
-	if (boot_params->secure_boot == efi_secureboot_mode_unset)
-		boot_params->secure_boot = efi_get_secureboot();
-	...
-	setup_graphics(boot_params);          // :487  GOP framebuffer → boot_params.screen_info
-	setup_efi_pci(boot_params);
-	...
-	status = exit_boot(boot_params, handle);   // :757
-	...
-	enter_kernel(kernel_entry, boot_params);   // :898
-```
-
-Each piece, mapped to its BIOS-path equivalent:
-
-| EFI stub step | Code | Replaces (QEMU/BIOS path) |
-|---|---|---|
-| **Build `boot_params` from scratch.** Comment at `x86-stub.c:502`: *"Because the x86 boot code expects to be passed a boot_params we need to create one ourselves (usually the bootloader would create one for us)."* Sets `hdr->type_of_loader = 0x21` and converts the UTF-16 load options to an ASCII command line. | `efi_allocate_bootparams()`, `:507` | QEMU/GRUB filling the setup header, plus `copy_boot_params()` in `main.c:30` |
-| **Decompress + KASLR.** Picks a random physical address with `efi_random_alloc()` (memory is allocated *from the firmware*, as `EFI_LOADER_CODE`), then calls the **same** `decompress_kernel()` from `compressed/misc.c:344`. | `efi_decompress_kernel()`, `:835` | `startup_32`/`startup_64`/`extract_kernel()`, Stage 5 |
-| **Load the initrd.** Prefers the `LINUX_EFI_INITRD_MEDIA_GUID` `LoadFile2` protocol, so the firmware or bootloader hands over the bytes. Otherwise it uses `initrd=` paths on the ESP. | `efi_load_initrd()`, `efi-stub-helper.c:612` | QEMU fw_cfg / GRUB `initrd` |
-| **Graphics.** Queries the GOP framebuffer. | `setup_graphics()`, `:487` | `set_video()` with `INT 10h` |
-| **Memory map + leave firmware.** `GetMemoryMap()`, then `ExitBootServices()`. After this, Boot Services (file I/O, allocation, …) are gone for good. The EFI memory map is converted into the e820 table the rest of the kernel expects. | `exit_boot()`, `:757` → `allocate_e820()` `:703`, `efi_exit_boot_services()`, `setup_e820()` `:572` | `detect_memory_e820()` with `INT 15h` |
-| **Leave a trail for the kernel.** Writes `"EL64"` into `boot_params.efi_info.efi_loader_signature`, plus the system table and memory map pointers. | `exit_boot_func()`, `:736` | — (nothing to hand over on BIOS) |
-| **Jump.** | `enter_kernel()`, `:898` | `jmp *%rax` at the end of `compressed/head_64.S` |
-
-`exit_boot()` (`x86-stub.c:757`):
-
-```c
-	status = allocate_e820(boot_params, &e820ext, &e820ext_size);
-	...
-	/* Might as well exit boot services now */
-	status = efi_exit_boot_services(handle, &priv, exit_boot_func);
-	...
-	status = setup_e820(boot_params, e820ext, e820ext_size);
-```
-
-`enter_kernel()` (`x86-stub.c:898`):
-
-```c
-	/* enter decompressed kernel with boot_params pointer in RSI/ESI */
-	asm("jmp *%0"::"r"(kernel_addr), "S"(boot_params));
-```
-
-`kernel_addr` is the ELF entry of the decompressed `vmlinux`, which is **`arch/x86/kernel/head_64.S` `startup_64`
-([Stage 6](#stage-6--the-real-kernels-first-instructions))**. The decompressor's own `startup_32`/`startup_64` never run on this path.
-
-### B5. After rejoining: the kernel remembers it was EFI-booted
-
-From Stage 6 on, the code is the same, but `setup_arch()` takes extra EFI branches. It detects the
-signature the stub left (`arch/x86/kernel/setup.c:554-561`):
-
-```c
-	if (!strncmp((char *)&boot_params.efi_info.efi_loader_signature,
-		     EFI32_LOADER_SIGNATURE, 4)) {
-		set_bit(EFI_BOOT, &efi.flags);
-	} else if (!strncmp((char *)&boot_params.efi_info.efi_loader_signature,
-		     EFI64_LOADER_SIGNATURE, 4)) {
-		set_bit(EFI_BOOT, &efi.flags);
-		set_bit(EFI_64BIT, &efi.flags);
-	}
-```
-
-and then:
-- `efi_memblock_x86_reserve_range()` — `setup.c:991-992`, protects the EFI memory map.
-- `efi_init()` — `setup.c:1008`, parses the system table and the config tables (ACPI RSDP, SMBIOS, …). On BIOS these are found by scanning low memory instead.
-- logs `Secure boot disabled/enabled` — `setup.c:1171`.
-- later, `efi_enter_virtual_mode()` (called from `arch/x86/kernel/cpu/common.c:2634`) calls the firmware's
-  `SetVirtualAddressMap()` (`arch/x86/platform/efi/efi.c:827`). After that, **Runtime Services** (`GetVariable`/`SetVariable`,
-  `ResetSystem`, the RTC) can be called from the kernel. This is what `/sys/firmware/efi/efivars` and `efibootmgr` use.
-  A BIOS has nothing comparable once the kernel runs.
-
-Stages 7–10 (`start_kernel`, `rest_init`, initramfs, `/init`) are identical on all three paths.
+So on modern hardware, Stages 3-4 are the path you see **least**. Problems with disk layout, bootloader, ESP, or
+Secure Boot **cannot be reproduced** with `-kernel`. To try the UEFI path under QEMU, use OVMF firmware instead of SeaBIOS
+(not tested in this repo's setup).
 
 ---
 
-## Why the QEMU `-kernel` boot is different from both
-
-| QEMU `-kernel` does this | Real BIOS machine | Real UEFI machine |
-|---|---|---|
-| The kernel file is read by the **host**, outside the VM | read by GRUB from the guest disk | read by the firmware (FAT ESP) or a bootloader |
-| No MBR, no partition table, no ESP | needs a 0x55AA MBR + GRUB `core.img` | needs a FAT ESP + `BootOrder` entry or `BOOTX64.EFI` |
-| No bootloader; an option ROM injected by QEMU does the job | GRUB (filesystem drivers, config, menu) | shim/GRUB/systemd-boot, or none (EFI stub) |
-| Data moved over **fw_cfg DMA**, a QEMU-only paravirtual device | `INT 13h` / native storage drivers | UEFI Block IO / Simple File System protocols |
-| Enters the kernel in **16-bit real mode** (oldest protocol) | usually **32-bit** (`linux`) | **64-bit**, via the EFI stub |
-| Kernel's `arch/x86/boot/main.c` queries the BIOS | GRUB queries the BIOS | stub queries UEFI |
-| `type_of_loader = 0xB0` (QEMU) | GRUB's ID | `0x21` (EFI stub) |
-| POST is short (emulated, RAM works immediately) | real DRAM training, chipset, option ROMs | same, in SEC/PEI/DXE |
-
-Consequences when you experiment with this repo:
-- **Stages 3–4 run here, but they are the path you will see least on real machines.** Read them for history and for
-  how real-mode code works, but expect real laptops and servers to enter at Stage 5 (GRUB on BIOS) or through `efi_stub_entry()` (UEFI).
-- Bugs in disk layout, the bootloader, the ESP, or Secure Boot **cannot reproduce** with `-kernel`.
-- To boot the **UEFI path** under QEMU, use OVMF firmware instead of SeaBIOS (QEMU ships edk2 builds, e.g.
-  `edk2-x86_64-code.fd`; the exact path depends on how QEMU was installed). With OVMF, `-kernel` still uses fw_cfg, but OVMF
-  loads the file as an EFI image. From OVMF's [`X86QemuLoadImageLib.c`](https://github.com/tianocore/edk2/blob/master/OvmfPkg/Library/X86QemuLoadImageLib/X86QemuLoadImageLib.c):
-  > "// Load the image. This should call back into the QEMU EFI loader file system."
-
-  That is `gBS->LoadImage()` → the kernel's `efi_pe_entry()`. Its fallback to the old bzImage-parsing loader is
-  *"insecure and deprecated"* and disabled unless `opt/org.tianocore/EnableLegacyLoader` is set through fw_cfg.
-  I have not tested this in this repo's setup (macOS + `-accel hvf`), so the command line is left to you.
-- To exercise **Path A** for real, you would boot a disk image with an MBR and GRUB installed (`-drive file=disk.img`) instead of `-kernel`.
-
-## Suggested reading order in the container
+## Reading order in the container
 
 ```sh
 make shell
 cd ~/git/linux
-hx Documentation/arch/x86/boot.rst          # the bootloader ↔ kernel contract
-hx arch/x86/boot/header.S                   # stage 3
-hx arch/x86/boot/main.c arch/x86/boot/pm.c arch/x86/boot/pmjump.S   # stage 3–4
+hx Documentation/arch/x86/boot.rst                                   # the bootloader <-> kernel contract
+hx arch/x86/boot/header.S arch/x86/boot/main.c arch/x86/boot/pm.c    # stages 3-4
 hx arch/x86/boot/compressed/head_64.S arch/x86/boot/compressed/misc.c   # stage 5
-hx arch/x86/kernel/head_64.S arch/x86/kernel/head64.c   # stage 6
-hx init/main.c                              # stage 7–9
-hx init/initramfs.c                         # stage 9b
+hx arch/x86/kernel/head_64.S arch/x86/kernel/head64.c                # stage 6
+hx init/main.c init/initramfs.c                                      # stages 7-9
 ```
 
-To watch the stages live, add `earlyprintk=serial,ttyS0 debug` to QEMU's `-append`. The `debug` flag
-makes stage 3 print `early console in setup code` (`main.c:142-143`), and the decompressor prints
-`Decompressing Linux... done. Booting the kernel` (`misc.c:514-523`).
+To watch the stages live, add `earlyprintk=serial,ttyS0 debug` to QEMU's `-append`.
 
 ## Sources
 
-- In-tree: `Documentation/arch/x86/boot.rst` (Linux/x86 boot protocol), plus every file:line cited above (commit `0fcb05b72`).
-- SeaBIOS — [Execution and code flow](https://github.com/coreboot/seabios/blob/master/docs/Execution_and_code_flow.md)
-- QEMU — [`hw/i386/x86-common.c`](https://github.com/qemu/qemu/blob/master/hw/i386/x86-common.c) (`x86_load_linux`)
-- QEMU — [`pc-bios/optionrom/linuxboot_dma.c`](https://github.com/qemu/qemu/blob/master/pc-bios/optionrom/linuxboot_dma.c)
-- Intel 80386 Programmer's Reference Manual §10.2 — [reset state](https://courses.cs.washington.edu/courses/cse451/23wi/documentation/i386/s10_02.htm)
-- In-tree: `Documentation/admin-guide/efi-stub.rst`, `drivers/firmware/efi/libstub/x86-stub.c`
-- SeaBIOS — [`src/boot.c`](https://github.com/coreboot/seabios/blob/master/src/boot.c) (`boot_disk`, `boot_rom`)
-- GRUB — manual (`docs/grub.texi`: "Images", "BIOS installation", "GNU/Linux") and
-  [`grub-core/loader/i386/linux.c`](https://github.com/rhboot/grub2/blob/master/grub-core/loader/i386/linux.c), read from the rhboot mirror
-- EDK II — [Build Specification §2.3, boot sequence](https://tianocore-docs.github.io/edk2-BuildSpecification/release-1.28/2_design_discussion/23_boot_sequence.html)
-- EDK II / OVMF — [`X86QemuLoadImageLib.c`](https://github.com/tianocore/edk2/blob/master/OvmfPkg/Library/X86QemuLoadImageLib/X86QemuLoadImageLib.c)
-- UEFI spec §3.5.1.1 removable-media path, quoted via [U-Boot patch discussion](https://lists.denx.de/pipermail/u-boot/2022-May/483315.html) (the uefi.org spec page returned 403)
+- In-tree: `Documentation/arch/x86/boot.rst`, `Documentation/admin-guide/efi-stub.rst`, and every file:line above (commit `0fcb05b72`).
+- Intel 80386 Programmer's Reference Manual §10.2 - [reset state](https://courses.cs.washington.edu/courses/cse451/23wi/documentation/i386/s10_02.htm)
+- SeaBIOS - [Execution and code flow](https://github.com/coreboot/seabios/blob/master/docs/Execution_and_code_flow.md),
+  [`src/post.c`](https://github.com/coreboot/seabios/blob/master/src/post.c), [`src/boot.c`](https://github.com/coreboot/seabios/blob/master/src/boot.c)
+- QEMU - [`hw/i386/x86-common.c`](https://github.com/qemu/qemu/blob/master/hw/i386/x86-common.c),
+  [`pc-bios/optionrom/linuxboot_dma.c`](https://github.com/qemu/qemu/blob/master/pc-bios/optionrom/linuxboot_dma.c)
+- GRUB - manual ("Images", "BIOS installation", "GNU/Linux") and
+  [`grub-core/loader/i386/linux.c`](https://github.com/rhboot/grub2/blob/master/grub-core/loader/i386/linux.c) (rhboot mirror)
+- EDK II - [Build Specification §2.3, boot sequence](https://tianocore-docs.github.io/edk2-BuildSpecification/release-1.28/2_design_discussion/23_boot_sequence.html)
